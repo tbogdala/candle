@@ -140,6 +140,7 @@ struct LayerWeights {
     sin: Tensor,
     neg_inf: Tensor,
     kv_cache: Option<(Tensor, Tensor)>,
+    masks: HashMap<(usize, usize), Tensor>,
     span_attn: tracing::Span,
     span_rot: tracing::Span,
     span_mlp: tracing::Span,
@@ -162,14 +163,30 @@ impl LayerWeights {
         candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
     }
 
+    fn mask(&mut self, t: usize, u: usize) -> Result<Tensor> {
+        if let Some(mask) = self.masks.get(&(t, u)) {
+            Ok(mask.clone())
+        } else {
+            let mask: Vec<_> = 
+                (0..t).flat_map(|i| 
+                    (0..u).map(move |j| 
+                        u8::from(j + t > i + u)))
+                    .collect();
+            let mask = Tensor::from_slice(&mask, (t, u), &self.sin.device())?;
+            self.masks.insert((t, u), mask.clone());
+            Ok(mask)
+        }
+    }
+
     fn forward_attn(
         &mut self,
         x: &Tensor,
-        mask: Option<&Tensor>,
         index_pos: usize,
     ) -> Result<Tensor> {
-        let _enter = self.span_attn.enter();
         let (b_sz, seq_len, n_embd) = x.dims3()?;
+        let mask = self.mask(seq_len, index_pos + seq_len)?;
+            
+        let _enter = self.span_attn.enter();
         let q = self.attention_wq.forward(x)?;
         let k = self.attention_wk.forward(x)?;
         let v = self.attention_wv.forward(x)?;
@@ -210,12 +227,11 @@ impl LayerWeights {
         let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?;
 
         let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-        let att = match mask {
-            None => att,
-            Some(mask) => {
-                let mask = mask.broadcast_as(att.shape())?;
-                masked_fill(&att, &mask, &self.neg_inf)?
-            }
+        let att = if seq_len == 1 {
+            att
+        } else {
+            let mask = mask.broadcast_as(att.shape())?;
+            masked_fill(&att, &mask, &self.neg_inf)?
         };
         let att = candle_nn::ops::softmax_last_dim(&att)?;
         // Convert to contiguous as matmul doesn't support strided vs for now.
@@ -232,7 +248,6 @@ pub struct ModelWeights {
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     output: QMatMul,
-    masks: HashMap<usize, Tensor>,
     span: tracing::Span,
     span_output: tracing::Span,
 }
@@ -302,6 +317,7 @@ impl ModelWeights {
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
                 kv_cache: None,
+                masks: HashMap::new(),
                 span_attn,
                 span_rot,
                 span_mlp,
@@ -314,7 +330,6 @@ impl ModelWeights {
             layers,
             norm,
             output: QMatMul::from_qtensor(output)?,
-            masks: HashMap::new(),
             span,
             span_output,
         })
@@ -422,6 +437,7 @@ impl ModelWeights {
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
                 kv_cache: None,
+                masks: HashMap::new(),
                 span_attn,
                 span_rot,
                 span_mlp,
@@ -434,39 +450,20 @@ impl ModelWeights {
             layers,
             norm,
             output: QMatMul::from_qtensor(output)?,
-            masks: HashMap::new(),
             span,
             span_output,
         })
     }
 
-    fn mask(&mut self, t: usize, device: &Device) -> Result<Tensor> {
-        if let Some(mask) = self.masks.get(&t) {
-            Ok(mask.clone())
-        } else {
-            let mask: Vec<_> = (0..t)
-                .flat_map(|i| (0..t).map(move |j| u8::from(j > i)))
-                .collect();
-            let mask = Tensor::from_slice(&mask, (t, t), device)?;
-            self.masks.insert(t, mask.clone());
-            Ok(mask)
-        }
-    }
-
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
-        let mask = if seq_len == 1 {
-            None
-        } else {
-            Some(self.mask(seq_len, x.device())?)
-        };
         let _enter = self.span.enter();
         let mut layer_in = self.tok_embeddings.forward(x)?;
         for layer in self.layers.iter_mut() {
             let x = layer_in;
             let residual = &x;
             let x = layer.attention_norm.forward(&x)?;
-            let attn = layer.forward_attn(&x, mask.as_ref(), index_pos)?;
+            let attn = layer.forward_attn(&x, index_pos)?;
             let x = (attn + residual)?;
 
             // MLP

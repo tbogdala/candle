@@ -13,6 +13,12 @@ and ease of use. Try our online demos:
 [Segment
 Anything](https://huggingface.co/spaces/radames/candle-segment-anything-wasm).
 
+## Things that are different in this fork?
+
+* The `quantized` example, and `candle_transformers::models::quantized_llama` have prompt batching support which is basically 
+  required for smooth operation with prompts of non-trivial sizes.
+
+
 ## Get started
 
 Make sure that you have [`candle-core`](https://github.com/huggingface/candle/tree/main/candle-core) correctly installed as described in [**Installation**](https://huggingface.github.io/candle/guide/installation.html).

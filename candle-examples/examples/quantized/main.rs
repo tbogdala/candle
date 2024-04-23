@@ -222,9 +222,9 @@ struct Args {
     #[arg(long)]
     verbose_prompt: bool,
 
-    /// Process prompt elements separately.
+    /// Process prompt elements separately in batches determined by size.
     #[arg(long)]
-    split_prompt: bool,
+    prompt_batch_size: Option<usize>,
 
     /// Run on CPU rather than GPU even if a GPU is available.
     #[arg(long)]
@@ -527,20 +527,19 @@ fn main() -> anyhow::Result<()> {
         };
 
         let start_prompt_processing = std::time::Instant::now();
-        let mut next_token = if !args.split_prompt {
+        let mut next_token = if let Some(batch_size) = args.prompt_batch_size {
+            let mut prompt_logits: Option<Tensor> = None;
+            for (chunk_index, chunk) in prompt_tokens.chunks(batch_size).enumerate() {
+                let input = Tensor::new(chunk, &device)?.unsqueeze(0)?;
+                prompt_logits = Some(model.forward(&input, chunk_index * batch_size)?);   
+            }
+            let logits = prompt_logits.unwrap().squeeze(0)?;
+            logits_processor.sample(&logits)?
+        } else {
             let input = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;
             let logits = model.forward(&input, 0)?;
             let logits = logits.squeeze(0)?;
             logits_processor.sample(&logits)?
-        } else {
-            let mut next_token = 0;
-            for (pos, token) in prompt_tokens.iter().enumerate() {
-                let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
-                let logits = model.forward(&input, pos)?;
-                let logits = logits.squeeze(0)?;
-                next_token = logits_processor.sample(&logits)?
-            }
-            next_token
         };
         let prompt_dt = start_prompt_processing.elapsed();
         all_tokens.push(next_token);
